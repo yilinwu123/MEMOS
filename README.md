@@ -1,106 +1,63 @@
-# MEMOS: A Query-Based Multi-Document Benchmark for Meeting Summarization
+# Pipeline
 
-Code and data for **MEMOS** (**M**ulti-document **E**valuation of **M**eeting **O**pen-query **S**ummarization).
-MEMOS adapts [QMSum](https://github.com/Yale-LILY/QMSum) into query-based summarization over 1–8 meeting
-transcripts. Generated summaries are evaluated bullet by bullet in two stages:
-- **Stage 1** checks each bullet against the gold bullets by embedding similarity.
-- **Stage 2** sends the bullets Stage 1 could not verify to an LLM judge, which assigns each one an error label.
+Code for building gold bullets, generating summaries, and running the two-stage bullet-level evaluation of
+MEMOS. Four scripts run in order (A2 → B → C → D) and share two modules: `common.py` and `prompts.py`.
 
 ```
-             A. Dataset                        B. Summarization        C. Stage 1               D. Stage 2
-QMSum ──► clusters + merged queries ──┐
-     └──► gold answers ──► gold bullets ┴──► LLM bullet summary ──► embedding top-1 ≥ 0.62 ──► LLM judge on
-                                                                    GROUNDED / UNGROUNDED      UNGROUNDED bullets
+gold answer ──► A2. gold bullets ──────────────────────────┐
+                                                           ▼
+query + transcripts ──► B. LLM summary ──► C. Stage 1 (embedding) ──► D. Stage 2 (LLM judge)
+                           (bullets)         GROUNDED / UNGROUNDED     error label per UNGROUNDED bullet
 ```
 
-## Repository layout
+| File | Step | What it does |
+|---|---|---|
+| `a_split_gold_bullets.py` | A2 | Splits each gold answer into atomic gold bullets |
+| `b_summarize.py` | B | Generates a bullet-point summary for each case with one of six LLMs |
+| `c_stage1_grounding.py` | C | Stage 1: labels each bullet GROUNDED / UNGROUNDED by embedding similarity to the gold bullets |
+| `d_stage2_error_analysis.py` | D | Stage 2: sends UNGROUNDED bullets to an LLM judge for a gold check and an error label |
+| `common.py` | – | OpenRouter client, JSON I/O, QMSum loading, context building, summary parsing |
+| `prompts.py` | – | Every prompt used by A2, B, and D |
 
-```
-data/
-  qmsum/                     # place the QMSum meeting files here (not redistributed, see Setup)
-  multidoc/
-    queries.json              # A1: clusters (group_id, member queries, merged query)
-    gold_bullets.json         # A2: gold bullets
-  singledoc/
-    run_cases_50.csv          # A1: single-document cases (QMSum meeting, specific-query index)
-    gold_bullets.json         # A2: gold bullets
-pipeline/
-  common.py                   # OpenRouter client, QMSum loading, context building
-  prompts.py                  # every prompt used in the pipeline
-  a_split_gold_bullets.py     # A2. gold answer -> atomic gold bullets
-  b_summarize.py              # B.  query-focused summarization (6 models)
-  c_stage1_grounding.py       # C.  Stage 1: embedding grounding
-  d_stage2_error_analysis.py  # D.  Stage 2: LLM-judge error classification
-scripts/
-  run_multidoc.sh             # B -> C -> D for the multi-document setting
-  run_singledoc.sh            # B -> C -> D for the single-document setting
-```
+Every script takes `--setting multidoc` or `--setting singledoc`. Run the scripts from the repository root, as
+in the examples below.
 
-## Setup
+## Requirements
 
 ```bash
-pip install -r requirements.txt          # Python >= 3.9
-export OPENROUTER_API_KEY=<your key>      # all LLM and embedding calls go through OpenRouter
+pip install -r requirements.txt           # openai, numpy; Python >= 3.9
+export OPENROUTER_API_KEY=<your key>       # every LLM and embedding call goes through OpenRouter
+export QMSUM_ROOT=/path/to/QMSum/data/ALL  # optional; default: data/qmsum/ (searched recursively)
 ```
 
-Every script reads the API key from the `OPENROUTER_API_KEY` environment variable.
+`QMSUM_ROOT` can also be set with `--qmsum-root` on A2, B, and D. Input and output locations are defined at the
+top of `common.py` (`CASES`, `GOLD_BULLETS`, `OUTPUT_ROOT`), relative to the repository root.
 
-**QMSum.** The scripts read the original QMSum per-meeting JSON files (`<meeting_id>.json` with
-`meeting_transcripts` and `specific_query_list`). Download QMSum and either copy the meeting files into
-`data/qmsum/` or point `QMSUM_ROOT` at them:
+## A2. Gold bullets: `a_split_gold_bullets.py`
 
-```bash
-git clone https://github.com/Yale-LILY/QMSum.git
-export QMSUM_ROOT=$PWD/QMSum/data/ALL    # searched recursively; duplicate meeting IDs are de-duplicated
-```
-
-All scripts also accept `--qmsum-root`.
-
-## A. Dataset construction
-
-### A1. Instances
-
-**Multi-document.** Each instance is a cluster of QMSum specific queries whose answers come from different
-parts of one or more meetings. The cluster's queries are rewritten into one merged query.
-
-```json
-{"cluster_id": "cluster_0",
- "group_id": "IS1003b_sq_6|IS1003d_sq_0",
- "query_list": ["Summarize the discussion about product appearance.", "..."],
- "merged_query": "Summarize the discussion about product appearance."}
-```
-
-`<meeting_id>_sq_<i>` refers to the i-th entry of that meeting's `specific_query_list` in QMSum. The input
-documents are the distinct meetings in `group_id`. The gold answer is the members' QMSum answers joined by
-newlines.
-
-**Single-document.** `data/singledoc/run_cases_50.csv` lists `(case, index)` pairs. Each pair is one
-QMSum meeting with its `specific_query_list[index]` query and answer.
-
-### A2. Gold bullets
-
-Each gold answer is split into atomic, self-contained bullets that keep the original wording, using
-`google/gemini-3-flash-preview` (prompt: `GOLD_SPLIT_SYSTEM` in `pipeline/prompts.py`). The released gold
-bullets are in `data/multidoc/gold_bullets.json` and `data/singledoc/gold_bullets.json`, one entry per case:
-
-```json
-{"group_id": "IS1003b_sq_6|IS1003d_sq_0", "query": "...", "gold": "<merged gold answer>",
- "gold_bullets": ["bullet 1", "bullet 2", "..."]}
-```
-
-To regenerate them (the LLM output is not deterministic, so new runs will differ slightly from the
-released files):
+Each gold answer is decomposed into atomic, self-contained bullets that keep the original wording, using
+`google/gemini-3-flash-preview`.
+- **Multi-document cases**: the gold answer is the members' QMSum answers joined in document order. The query is
+  the merged query, and the DOCUMENT shown to the model is the concatenated multi-document context.
+- **Single-document cases**: the query, answer, and transcript come directly from QMSum.
 
 ```bash
 python pipeline/a_split_gold_bullets.py --setting multidoc  --output outputs/gold/multidoc_gold_bullets.json
 python pipeline/a_split_gold_bullets.py --setting singledoc --output outputs/gold/singledoc_gold_bullets.json
 ```
 
-## B. Summarization
+Output is one JSON list: `[{"group_id", "query", "gold", "gold_bullets": [...]}, ...]`. The file is re-saved after
+every case and resumes from existing entries. A failed call, or one that returns no bullets, is not saved and is
+retried on the next run.
+
+Prompt: `GOLD_SPLIT_SYSTEM` with `gold_split_user_prompt_*` (paper: Gold Answer Decomposition Prompt). The
+single-document variant uses identical text without blank lines.
+
+## B. Summarization: `b_summarize.py`
 
 ```bash
-python pipeline/b_summarize.py --setting multidoc  --model qwen   # data/multidoc/queries.json      -> outputs/multidoc/qwen/
-python pipeline/b_summarize.py --setting singledoc --model qwen   # data/singledoc/run_cases_50.csv -> outputs/singledoc/qwen/
+python pipeline/b_summarize.py --setting multidoc  --model qwen   # -> outputs/multidoc/qwen/
+python pipeline/b_summarize.py --setting singledoc --model qwen   # -> outputs/singledoc/qwen/
 ```
 
 | `--model` | OpenRouter ID |
@@ -112,21 +69,27 @@ python pipeline/b_summarize.py --setting singledoc --model qwen   # data/singled
 | `nvidia` | `nvidia/nemotron-3-ultra-550b-a55b` |
 | `gpt` | `openai/gpt-5.6-terra` |
 
-All models receive the same prompt and run on all cases, with reasoning enabled, `max_tokens=10000` and
-JSON output mode.
-The model is asked for `{"bullets": [{"point": ..., "evidence_quote": ...}]}`.
+- **Decoding**: every model is called with reasoning enabled (`reasoning: {enabled: true}`), JSON output mode,
+  and `max_tokens=10000`. Temperature and other sampling parameters are not set, so provider defaults apply.
+- **Prompt**: `summarize_prompt_multidoc` / `summarize_prompt_singledoc` (paper: Figure 2). The model returns
+  `{"bullets": [{"point": ..., "evidence_quote": ..., "doc_ids": [...]}]}`.
+- **Context**: each transcript is headed by `This is meeting_transcript <i>.` and `Document ID: <id>`.
+  Consecutive transcripts are separated by a line of `=` (`common.build_multidoc_context`).
+- **Outputs per case**:
+  - `<id>_summary.json`, with the raw model output in `summary` (multi-document) or `summarization_point`
+    (single-document).
+  - `<id>_context.txt` (multi-document only): the exact context the model saw, which Stage 2 reuses.
+- **Failures**: existing summaries are skipped. API errors, and outputs that are not a JSON object with a
+  `bullets` list, are written to `<id>_error.json` and retried on the next run.
 
-Outputs per case: `<id>_summary.json`. In the multi-document setting, `<id>_context.txt` is also written: the
-exact concatenated context the model saw, which Stage 2 reuses. Runs are resumable, and failed calls are
-written to `<id>_error.json` and retried on the next run.
+## C. Stage 1, embedding grounding: `c_stage1_grounding.py`
 
-## C. Stage 1: embedding grounding
-
-Each generated bullet `b` is embedded with `qwen/qwen3-embedding-8b`, and
+Every generated bullet `b` and gold bullet `g_j` is embedded with `qwen/qwen3-embedding-8b`
+(L2-normalized), and
 
 ```
-top1(b) = max_j cos(b, g_j)   over gold bullets g_j
-top1(b) >= 0.62  ->  GROUNDED      otherwise  ->  UNGROUNDED
+top1(b) = max_j cos(b, g_j)
+top1(b) >= 0.62  ->  GROUNDED      otherwise  ->  UNGROUNDED (passed to Stage 2)
 ```
 
 ```bash
@@ -134,34 +97,68 @@ python pipeline/c_stage1_grounding.py --setting multidoc  --summary-dir outputs/
 python pipeline/c_stage1_grounding.py --setting singledoc --summary-dir outputs/singledoc/qwen
 ```
 
-Output: `<id>_judge_embtop1.json` with per-bullet labels, the top-5 most similar gold bullets and scores,
-and case-level `metrics` (bullet count, grounded/ungrounded counts and rates).
+Options: `--threshold` (default 0.62) and `--overwrite` (recompute existing outputs).
 
-## D. Stage 2: LLM-judge error analysis
+Output: `<id>_judge_embtop1.json`, containing the query, the gold bullets, case-level `metrics`, and a `bullets`
+list. Case-level metrics are bullet count, grounded and ungrounded counts, and their rates; the ungrounded rate is
+1 − precision. Each bullet has its `category` (GROUNDED / UNGROUNDED) and a `grounding` record:
+- `best_emb`: the top-1 score.
+- `evidence` and `evidence_scores`: the top-5 gold bullets and their scores.
+- `gold_scores`: the cosine to every gold bullet, in gold order, used for one-to-one gold matching when
+  computing recall.
 
-All UNGROUNDED bullets of a case are sent to `google/gemini-3-flash-preview` in one call, together with the
-query, the gold bullets and the source transcript(s). For each bullet, the judge:
+A valid empty summary (`{"bullets": []}`) is kept with 0 bullets, so the case's gold bullets still count towards
+recall.
 
-1. Checks the gold bullets strictly. If one gold bullet fully expresses the bullet, it is labeled
-   `MATCHED_IN_GOLD`, i.e. a Stage-1 false negative.
-2. Otherwise assigns one error label: `IRRELEVANT`, `EVIDENCE_HALLUCINATION`,
-   `UNSUPPORTED_INFERENCE - MOTIVE / RELATION / SYNTHESIS`, `OVERCLAIM`, `OVERSPECIFICATION`, or a new
-   descriptive label if none fits.
+## D. Stage 2, LLM judge: `d_stage2_error_analysis.py`
 
-If the batch response cannot be parsed, each bullet is judged in a separate call.
+All UNGROUNDED bullets of a case go to `google/gemini-3-flash-preview` (`max_tokens=10000`, provider-default
+sampling) in one call. The call includes the query, the gold bullets, and the source transcript:
+- **Multi-document**: the transcript is `<id>_context.txt` from step B.
+- **Single-document**: the transcript is the QMSum text, identical to what the summarizer saw.
+
+For each bullet the judge:
+
+1. **Gold check.** Labels the bullet `MATCHED_IN_GOLD` only if one gold bullet fully expresses it (coverage
+   FULL), i.e. a Stage-1 false negative.
+2. **Error label.** Otherwise assigns exactly one label that identifies the most fundamental error, using this
+   priority:
+
+   | Priority | Label |
+   |---|---|
+   | 1 | `IRRELEVANT` |
+   | 2 | `EVIDENCE_HALLUCINATION` |
+   | 3 | `OVERCLAIM` |
+   | 4 | `UNSUPPORTED_INFERENCE - MOTIVE / RELATION / SYNTHESIS` |
+   | 5 | `OVERSPECIFICATION` |
+
+   If none of these fit, the judge gives a new descriptive label.
 
 ```bash
 python pipeline/d_stage2_error_analysis.py --setting multidoc  --folder outputs/multidoc/qwen
 python pipeline/d_stage2_error_analysis.py --setting singledoc --folder outputs/singledoc/qwen
 ```
 
-Stage 2 judges every case in `--folder` that has a Stage-1 output. Use `--dry-run` to check inputs without
-calling the LLM. Output:
-`<id>_judge_embtop1_reanalyzed_nocon_withgold.json` (multi-document) or
-`<id>_judge_embtop1_reanalyzed_nocon_gold.json` (single-document). Each is the Stage-1 file with a
-`reanalysis` field added to every bullet.
+`--dry-run` checks file discovery and inputs without calling the LLM.
 
-## Run everything for one model
+Prompt: `STAGE2_BATCH_SYSTEM` with `stage2_batch_user_prompt` (paper: Error Classification Prompt).
+
+Output: `<id>_judge_embtop1_reanalyzed_nocon_withgold.json` (multi-document) or
+`<id>_judge_embtop1_reanalyzed_nocon_gold.json` (single-document). Each is the Stage-1 JSON with a `reanalysis`
+field on every bullet. It is `null` for GROUNDED bullets. For the others it holds `label` and `classification`,
+the judge's full output: `label`, `gold_coverage`, `gold_quote`, `uncovered_components`, `matched_gold_index`,
+`rationale`, and `evidence_quote`. The script ends by
+printing the label distribution and the Stage-1 miss rate (MATCHED_IN_GOLD / UNGROUNDED).
+
+Failure handling:
+- Each call is attempted up to 3 times.
+- If the batch response cannot be parsed, or its bullet indices do not match the ones sent, each bullet is judged
+  in its own call with the same prompt.
+- A case is not written if its source transcript is missing or any bullet is still unclassified, so it is retried
+  on the next run.
+- Existing outputs are skipped.
+
+## Running B → C → D for one model
 
 ```bash
 bash scripts/run_multidoc.sh qwen
@@ -170,9 +167,9 @@ bash scripts/run_singledoc.sh qwen
 
 ## Notes
 
-- `group_id` is the unique key of a multi-document instance. `cluster_id` is kept from each original subset
-  and is not unique across subsets.
-- One cluster (`IS1003b_sq_3|IS1003c_sq_3|IS1003d_sq_6`) has no `merged_query`; its member queries are
-  concatenated and used as the query for summarization and gold-bullet splitting.
-- LLM outputs are not deterministic, so re-running B–D gives results close to, but not identical with,
-  those reported in the paper.
+- **IDs**: `<meeting_id>_sq_<i>` is the i-th entry of that meeting's QMSum `specific_query_list`. A multi-document
+  case is keyed by `group_id`, its member query IDs joined by `|`. In file names `|` becomes `__`.
+- **Reproducibility**: LLM outputs are not deterministic, so re-running A2–D gives results close to, but not
+  identical with, those reported in the paper.
+- **Not included**: metric aggregation (micro-averaged precision, recall, F1) and the paper's additional analyses
+  (dataset construction, oracle baseline, position analysis) are not part of this folder.
